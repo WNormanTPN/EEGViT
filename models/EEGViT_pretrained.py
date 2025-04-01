@@ -6,8 +6,17 @@ import transformers
 class EEGViT_pretrained(nn.Module):
     def __init__(self):
         super().__init__()
+        # Thêm lớp tiền xử lý
+        self.preprocess = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=(3, 3), padding=(1, 1)),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.Conv2d(64, 256, kernel_size=(3, 3), padding=(1, 1)),
+            nn.ReLU(),
+            nn.BatchNorm2d(256)
+        )
         self.conv1 = nn.Conv2d(
-            in_channels=1,
+            in_channels=256,
             out_channels=256,
             kernel_size=(1, 36),
             stride=(1, 36),
@@ -18,7 +27,7 @@ class EEGViT_pretrained(nn.Module):
         model_name = "google/vit-base-patch16-224"
         config = transformers.ViTConfig.from_pretrained(model_name)
         config.update({'num_channels': 256})
-        config.update({'image_size': (136, 14)})  # Cập nhật image_size sau khi padding (129 -> 136)
+        config.update({'image_size': (136, 14)})
         config.update({'patch_size': (8, 1)})
 
         model = transformers.ViTForImageClassification.from_pretrained(
@@ -35,6 +44,7 @@ class EEGViT_pretrained(nn.Module):
         self.ViT = model
 
     def forward(self, x):
+        x = self.preprocess(x)
         x = self.conv1(x)
         x = self.batchnorm1(x)
         x = self.ViT.forward(x).logits

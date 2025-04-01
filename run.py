@@ -20,8 +20,26 @@ learning_rate = 1e-4
 
 # Loss, optimizer và scheduler
 criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)  # Thêm weight decay
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epoch)  # Dùng CosineAnnealingLR
+learning_rate = 3e-4
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+
+# Warmup scheduler
+class WarmupCosineAnnealingLR(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_epochs, total_epochs, eta_min=0, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            return [base_lr * (self.last_epoch + 1) / self.warmup_epochs for base_lr in self.base_lrs]
+        else:
+            return [self.eta_min + (base_lr - self.eta_min) *
+                    (1 + np.cos(np.pi * (self.last_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs))) / 2
+                    for base_lr in self.base_lrs]
+
+scheduler = WarmupCosineAnnealingLR(optimizer, warmup_epochs=3, total_epochs=n_epoch, eta_min=1e-6)
 
 def train(model, optimizer, criterion, scheduler=None):
     '''
