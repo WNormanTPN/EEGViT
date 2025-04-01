@@ -6,7 +6,6 @@ import transformers
 class EEGViT_pretrained(nn.Module):
     def __init__(self):
         super().__init__()
-        # Thêm lớp tiền xử lý
         self.preprocess = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=(3, 3), padding=(1, 1)),
             nn.ReLU(),
