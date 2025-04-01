@@ -7,129 +7,142 @@ from dataset.EEGEyeNet import EEGEyeNetDataset
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import numpy as np
 
-'''
-models: EEGViT_pretrained; EEGViT_raw; ViTBase; ViTBase_pretrained
-'''
+# Khởi tạo mô hình và dataset
 model = EEGViT_pretrained()
 EEGEyeNet = EEGEyeNetDataset('./dataset/Position_task_with_dots_synchronised_min.npz')
-batch_size = 64
+batch_size = 256  # Tăng batch size để tận dụng T4 x2
 n_epoch = 15
 learning_rate = 1e-4
 
+# Loss, optimizer và scheduler
 criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)  # Thêm weight decay
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epoch)  # Dùng CosineAnnealingLR
 
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=6, gamma=0.1)
-
-
-def train(model, optimizer, scheduler = None):
+def train(model, optimizer, criterion, scheduler=None):
     '''
-        model: model to train
-        optimizer: optimizer to update weights
-        scheduler: scheduling learning rate, used when finetuning pretrained models
+    model: model to train
+    optimizer: optimizer to update weights
+    scheduler: scheduling learning rate, used when finetuning pretrained models
     '''
     torch.cuda.empty_cache()
-    train_indices, val_indices, test_indices = split(EEGEyeNet.trainY[:,0],0.7,0.15,0.15)  # indices for the training set
+    scaler = GradScaler('cuda')  # Mixed precision training
+
+    # Chia dữ liệu
+    train_indices, val_indices, test_indices = split(EEGEyeNet.trainY[:, 0], 0.7, 0.15, 0.15)
     print('create dataloader...')
-    criterion = nn.MSELoss()
 
-    train = Subset(EEGEyeNet,indices=train_indices)
-    val = Subset(EEGEyeNet,indices=val_indices)
-    test = Subset(EEGEyeNet,indices=test_indices)
+    train = Subset(EEGEyeNet, indices=train_indices)
+    val = Subset(EEGEyeNet, indices=val_indices)
+    test = Subset(EEGEyeNet, indices=test_indices)
 
-    train_loader = DataLoader(train, batch_size=batch_size)
-    val_loader = DataLoader(val, batch_size=batch_size)
-    test_loader = DataLoader(test, batch_size=batch_size)
+    # DataLoader tối ưu cho T4 x2
+    train_loader = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val, batch_size=batch_size, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test, batch_size=batch_size, num_workers=4, pin_memory=True)
 
-    if torch.cuda.is_available():
-        gpu_id = 0  # Change this to the desired GPU ID if you have multiple GPUs
-        torch.cuda.set_device(gpu_id)
-        device = torch.device(f"cuda:{gpu_id}")
-    else:
-        device = torch.device("cpu")
+    # Thiết lập thiết bị
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)  # Wrap the model with DataParallel
-    print("HI")
-
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)  # Sử dụng multi-GPU
     model = model.to(device)
     criterion = criterion.to(device)
 
-    # Initialize lists to store losses
+    # Báo cáo GPU
+    print(f"Number of GPUs available: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+    print(f"Using device: {device}")
+
+    # Khởi tạo danh sách lưu loss
     train_losses = []
     val_losses = []
     test_losses = []
+    best_val_loss = float('inf')
+    patience, patience_counter = 5, 0
+
     print('training...')
-    # Train the model
+    # Vòng lặp huấn luyện
     for epoch in range(n_epoch):
         model.train()
         epoch_train_loss = 0.0
 
         for i, (inputs, targets, index) in tqdm(enumerate(train_loader)):
-            # Move the inputs and targets to the GPU (if available)
             inputs = inputs.to(device)
             targets = targets.to(device)
 
-            # Compute the outputs and loss for the current batch
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs.squeeze(), targets.squeeze())
+            with autocast('cuda'):  # Mixed precision
+                outputs = model(inputs)
+                loss = criterion(outputs.squeeze(), targets.squeeze())
 
-            # Compute the gradients and update the parameters
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            scaler.step(optimizer)
+            scaler.update()
             epoch_train_loss += loss.item()
 
-            # Print the loss and accuracy for the current batch
             if i % 100 == 0:
                 print(f"Epoch {epoch}, Batch {i}, Loss: {loss.item()}")
 
         epoch_train_loss /= len(train_loader)
         train_losses.append(epoch_train_loss)
 
-        # Evaluate the model on the validation set
+        # Đánh giá trên tập validation
         model.eval()
         with torch.no_grad():
             val_loss = 0.0
             for inputs, targets, index in val_loader:
-                # Move the inputs and targets to the GPU (if available)
                 inputs = inputs.to(device)
                 targets = targets.to(device)
 
-                # Compute the outputs and loss for the current batch
-                outputs = model(inputs)
-                # print(outputs)
-                loss = criterion(outputs.squeeze(), targets.squeeze())
+                with autocast('cuda'):
+                    outputs = model(inputs)
+                    loss = criterion(outputs.squeeze(), targets.squeeze())
                 val_loss += loss.item()
-
 
             val_loss /= len(val_loader)
             val_losses.append(val_loss)
-
             print(f"Epoch {epoch}, Val Loss: {val_loss}")
 
+            # Early stopping và lưu mô hình tốt nhất
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(model.module.state_dict(), '/kaggle/working/best_model.pth')  # Lưu mô hình gốc
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print("Early stopping triggered")
+                    break
+
+        # Đánh giá trên tập test
         with torch.no_grad():
-            val_loss = 0.0
+            test_loss = 0.0
             for inputs, targets, index in test_loader:
-                # Move the inputs and targets to the GPU (if available)
                 inputs = inputs.to(device)
                 targets = targets.to(device)
 
-                # Compute the outputs and loss for the current batch
-                outputs = model(inputs)
+                with autocast('cuda'):
+                    outputs = model(inputs)
+                    loss = criterion(outputs.squeeze(), targets.squeeze())
+                test_loss += loss.item()
 
-                loss = criterion(outputs.squeeze(), targets.squeeze())
-                val_loss += loss.item()
-
-            val_loss /= len(test_loader)
-            test_losses.append(val_loss)
-
-            print(f"Epoch {epoch}, test Loss: {val_loss}")
+            test_loss /= len(test_loader)
+            test_losses.append(test_loss)
+            print(f"Epoch {epoch}, Test Loss: {test_loss}")
 
         if scheduler is not None:
             scheduler.step()
 
+    # Lưu mô hình cuối cùng
+    torch.save(model.module.state_dict(), '/kaggle/working/final_model.pth')
+    print("Training completed. Best model saved as 'best_model.pth', final model as 'final_model.pth'")
+
 if __name__ == "__main__":
-    train(model,optimizer=optimizer, scheduler=scheduler)
+    train(model, optimizer, criterion, scheduler)
